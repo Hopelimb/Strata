@@ -458,7 +458,7 @@ def engine_pids(run=subprocess.run) -> list[int]:
     return [int(x) for x in out.split() if x.isdigit() and int(x) != os.getpid()]
 
 
-def start(cfg_path: Path, port: int | None, open_browser: bool = True) -> int:
+def start(cfg_path: Path, port: int | None, open_browser: bool = True, keep: dict | None = None) -> int:
     """serve/server.py with this config (setup.py's start without the NVIDIA / AMD card checks)."""
     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     missing = [p for p in [cfg["exe"], *[a for a in cfg["args"] if a.endswith(".gguf")]] if not Path(p).exists()]
@@ -468,6 +468,26 @@ def start(cfg_path: Path, port: int | None, open_browser: bool = True) -> int:
     if busy:       # never start an engine while a repack (or the pack after it) is writing: wait would hide a stuck one
         S.fail(f"a model repack is still running here (pid {busy[0]}): the engine is not started beside it",
                "wait for it to finish (or stop it), then start again")
+    keep = {k: v for k, v in (keep or {}).items() if v is not None}
+    ctx = keep.pop("context", None)
+    if ctx is not None:
+        args = cfg["args"]
+        if "--max-context" in args[:-1]:
+            old_ctx = args[args.index("--max-context") + 1]
+            if old_ctx != str(ctx):
+                args[args.index("--max-context") + 1] = str(ctx)
+                S.write_config(cfg_path, cfg)
+                S.ok(f"saved for this model: context {ctx}")
+        else:
+            args += ["--max-context", str(ctx)]
+            S.write_config(cfg_path, cfg)
+            S.ok(f"saved for this model: context {ctx}")
+    if keep and any(cfg.get(k) != v for k, v in keep.items()):
+        cfg.update(keep)
+        S.write_config(cfg_path, cfg)
+        S.ok("saved for this model: " + ", ".join(
+            "api key" if k == "api_key" else ("the browser opens" if v else "no browser") if k == "open_browser"
+            else f"{k.replace('_', ' ')} {v}" for k, v in keep.items()))
     cfg_path.touch()
     if "--mtp" in cfg["args"][:-1]:
         S.refresh_draft_vocab(Path(cfg["args"][cfg["args"].index("--mtp") + 1]), cfg.get("draft_vocab", "cjk"))
@@ -488,7 +508,7 @@ def main(argv=None) -> int:
     ap.add_argument("--family", choices=["qwen", "unsloth"], default=None,
                     help="qwen = Qwen3.8-Flash-Next (GSQ-RCO), unsloth = Unsloth's UD-*_K_XL (follows --model)")
     ap.add_argument("--model", choices=list(MAC_MODELS))
-    ap.add_argument("--context", type=int)
+    ap.add_argument("--context", "--max-context", dest="context", type=int)
     ap.add_argument("--port", type=int)
     ap.add_argument("--host")
     ap.add_argument("--api-key")
@@ -523,7 +543,9 @@ def main(argv=None) -> int:
 
     have = mac_configs()
     if have and not (a.setup or a.model or a.check or a.no_start or a.update or a.build):
-        return start(have[0], a.port, a.browser is not False)
+        return start(have[0], a.port, a.browser is not False,
+                     {"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab, "open_browser": a.browser,
+                      "context": a.context})
 
     # ---- 1. the Mac
     S.step(1, "checking your Mac")
