@@ -29,9 +29,15 @@ td.log
 /.venv/
 /build/
 /third_party/llama.cpp
+/third_party/metal-cpp
+/third_party/stable-diffusion.cpp
+/third_party/vulkan-sdk
+/third_party/_*
 /models/
 /packs/
 /mtp/
+/metal/*.gguf
+/metal/*.experts
 /run-*.bat
 /run-*.sh
 /strata-*.json
@@ -49,10 +55,12 @@ build-vision-cuda12.bat
 # setup.py outputs (engine, downloads) and release builds
 /engine/
 /engine-cuda12/
+/engine-image/
 /build-release*/
 /dist/
 *.done
 /third_party/*.zip
+/third_party/*.tar.xz
 
 # IDEs
 .vscode/
