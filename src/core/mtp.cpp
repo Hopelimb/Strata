@@ -57,7 +57,7 @@
 // The Metal backend's MTP drafter (metal/src/engine/window.cpp, beside the decode window it reads): load, prefill and
 // draft hand over to it; bind has nothing to bind there.
 namespace strata::metal_engine {
-bool mtp_load(const std::string& rt_dir, int max_t, std::string& err);
+bool mtp_load(const std::string& rt_dir, int max_t, strata::core::QsaState* kv, std::string& err);
 bool mtp_prefill(const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err);
 bool mtp_draft(int T, const int32_t* tokens, int64_t p, int a, int max_steps, int32_t* drafts, float* probs, float min_p,
                int* n_drafts, std::string& err);
@@ -254,7 +254,16 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     g_ = &g;
     ss_ = &ss;
     max_t_ = max_t;
-    return strata::metal_engine::mtp_load(rt_dir, max_t, err);
+    st_.max_cells = ss.max_cells;
+    st_.kv_int8 = true;
+    st_.kv_q4 = false;
+    st_.kv_hybrid = false;
+    st_.kv_rot = false;
+    st_.kv_mode = 0;
+    st_.n_pages = (st_.max_cells + 3) / 4;
+    st_.n_slots = st_.n_pages;
+    st_.idx_pooled_rows = st_.n_pages + 1;
+    return strata::metal_engine::mtp_load(rt_dir, max_t, &st_, err);
 #endif
     cudaGetDevice(&device_);   // a layer split's last stage on another GPU: the drafter lives there
     g_ = &g;

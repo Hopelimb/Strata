@@ -17,6 +17,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <mach/mach.h>
+#include <sys/sysctl.h>
 #endif
 
 namespace strata::core {
@@ -286,6 +289,19 @@ std::optional<HostMemoryReading> sample_host_memory() {
     return combine(std::min<uint64_t>(status.ullAvailPhys, status.ullAvailPageFile), status.ullTotalPhys, CgroupScan{}, memory_limit_bytes());
 #elif defined(__linux__)
     return sample_host_memory(MemoryProbePaths{}, memory_limit_bytes());
+#elif defined(__APPLE__)
+    vm_statistics64_data_t vs{};
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    vm_size_t page_bytes = 0;
+    if (host_page_size(mach_host_self(), &page_bytes) != KERN_SUCCESS ||
+        host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vs, &count) != KERN_SUCCESS)
+        return {};
+    const uint64_t avail = ((uint64_t) vs.free_count + vs.inactive_count + vs.purgeable_count) * (uint64_t) page_bytes;
+    uint64_t phys = 0;
+    size_t len = sizeof phys;
+    std::optional<uint64_t> total;
+    if (sysctlbyname("hw.memsize", &phys, &len, nullptr, 0) == 0 && phys > 0) total = phys;
+    return combine(avail, total, CgroupScan{}, memory_limit_bytes());
 #else
     return {};
 #endif

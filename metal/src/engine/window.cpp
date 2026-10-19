@@ -130,7 +130,7 @@ public:
     void reset();   // a new sequence (session_zero): the running state zeroed
     void set_max_t(int t) { max_t_ = std::min(t, MAXT); }
     // ---- the MTP draft layer (mtp.hpp's math on mac-kern's kernels; the MTP GGUF from tools/mtp_pack.py)
-    bool mtp_load(const std::string& gguf, int max_t, std::string& err);
+    bool mtp_load(const std::string& gguf, int max_t, strata::core::QsaState* kv, std::string& err);
     bool mtp_prefill(const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err);
     bool mtp_draft(int T, const int32_t* tokens, int64_t p, int a, int max_steps, int32_t* drafts, float* probs,
                    float min_p, int* n_drafts, std::string& err);
@@ -510,6 +510,24 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
             dead_.push_back(A(4 * 128));
             pooled_.push_back(A(4 * (size_t) MB * 128));
         }
+    }
+    for (size_t j = 0; j < kq_.size() && (int64_t) j < ss.qsa_alloc; ++j) {
+        auto& st = ss.qsa_states[ss.qsa_ord0 + j];
+        st.kv_int8 = true;
+        st.kv_q4 = false;
+        st.kv_hybrid = false;
+        st.kv_rot = false;
+        st.kv_mode = 0;
+        st.n_pages = (st.max_cells + 3) / 4;
+        st.n_slots = st.n_pages;
+        st.idx_pooled_rows = st.n_pages + 1;
+        st.k_q = kq_[j].as<int8_t>();
+        st.v_q = vq_[j].as<int8_t>();
+        st.k_scale = ksc_[j].as<uint16_t>();
+        st.v_scale = vsc_[j].as<uint16_t>();
+        st.idx_tail = tail_[j].as<float>();
+        st.idx_dead = dead_[j].as<float>();
+        st.idx_pooled = pooled_[j].as<float>();
     }
     // ---- the HC read in Q8_0 (the owner's default on Metal, as STRATA_HC_Q8 on gfx12): the BF16 down / up / inject
     // matrices quantized once at load (ggml's q8_0 rule, ref_quant), read by gr_down_q8 / gr_up_q8
@@ -1403,7 +1421,7 @@ bool Window::checkpoint_save(strata::core::ConversationCheckpoint& c, std::strin
         cx_->run_graph(ds);
         pend_fold_ = 0;
     }
-    const size_t gs = 4 * 128 * 48 * 128, hs = 4 * 10240 * 3, ts = 4 * 4 * 128, dsz = 4 * 128;
+    const size_t gs = 4 * 128 * 48 * 128, hs = 4 * 10240 * 3, ts = 4 * 3 * 128, dsz = 4 * 128;
     c.gdn.resize(gst_.size() * (gs + hs));
     for (size_t i = 0; i < gst_.size(); ++i) {
         std::memcpy(c.gdn.data() + i * (gs + hs), gst_[i].ptr, gs);
@@ -1416,7 +1434,7 @@ bool Window::checkpoint_save(strata::core::ConversationCheckpoint& c, std::strin
         std::memcpy(c.tails.data() + j * ts, tail_[j].ptr, ts);
         std::memcpy(c.dead.data() + j * dsz, dead_[j].ptr, dsz);
     }
-    c.block_pos.clear();
+    c.block_pos.assign(tail_.size() * sizeof(int32_t), 0);
     return true;
 }
 
@@ -1441,9 +1459,10 @@ void Window::reset() {
 }
 
 bool Window::checkpoint_restore(const strata::core::ConversationCheckpoint& c, std::string& err) {
-    const size_t gs = 4 * 128 * 48 * 128, hs = 4 * 10240 * 3, ts = 4 * 4 * 128, dsz = 4 * 128;
+    const size_t gs = 4 * 128 * 48 * 128, hs = 4 * 10240 * 3, ts = 4 * 3 * 128, dsz = 4 * 128;
     if (c.gdn.size() != gst_.size() * (gs + hs) || c.ple.size() != (size_t) 4 * 9 * 10240 ||
-        c.tails.size() != tail_.size() * ts || c.dead.size() != dead_.size() * dsz) {
+        c.tails.size() != tail_.size() * ts || c.dead.size() != dead_.size() * dsz ||
+        c.block_pos.size() != tail_.size() * sizeof(int32_t)) {
         err = "metal window: the checkpoint is not this engine's (sizes differ)";
         return false;
     }
@@ -1508,7 +1527,7 @@ bool Window::commit(int n_keep, std::string& err) {
 
 
 // ================================================================================================ the MTP draft layer
-bool Window::mtp_load(const std::string& gguf_path, int max_t, std::string& err) {
+bool Window::mtp_load(const std::string& gguf_path, int max_t, strata::core::QsaState* kv, std::string& err) {
     (void) max_t;
     if (!fm_.open(gguf_path, err)) return false;
     madvise(fm_.map, fm_.map_bytes, MADV_WILLNEED);
@@ -1571,6 +1590,24 @@ bool Window::mtp_load(const std::string& gguf_path, int max_t, std::string& err)
     mkq_.push_back(A((size_t) MAXC * 2 * 256)); mvq_.push_back(A((size_t) MAXC * 2 * 256));
     mksc_.push_back(A(2 * (size_t) MAXC * 2 * 4)); mvsc_.push_back(A(2 * (size_t) MAXC * 2 * 4));
     mtail_.push_back(A(4 * 4 * 128)); mdead_.push_back(A(4 * 128)); mpooled_.push_back(A(4 * (size_t) MB * 128));
+    if (kv != nullptr) {
+        kv->max_cells = ss_ ? ss_->max_cells : max_cells_;
+        kv->kv_int8 = true;
+        kv->kv_q4 = false;
+        kv->kv_hybrid = false;
+        kv->kv_rot = false;
+        kv->kv_mode = 0;
+        kv->n_pages = (kv->max_cells + 3) / 4;
+        kv->n_slots = kv->n_pages;
+        kv->idx_pooled_rows = kv->n_pages + 1;
+        kv->k_q = mkq_[0].as<int8_t>();
+        kv->v_q = mvq_[0].as<int8_t>();
+        kv->k_scale = mksc_[0].as<uint16_t>();
+        kv->v_scale = mvsc_[0].as<uint16_t>();
+        kv->idx_tail = mtail_[0].as<float>();
+        kv->idx_dead = mdead_[0].as<float>();
+        kv->idx_pooled = mpooled_[0].as<float>();
+    }
     {
         std::string vp;
         // the subset setup put beside the draft layer (--draft-vocab: <mtp>/rt/draft_vocab.bin, as CUDA reads it),
@@ -2544,7 +2581,8 @@ void window_register(void* w) { g_window = (Window*) w; }
 // the engine loads the drafter before the decode window exists: the path is kept and the window loads it at its init
 std::string g_mtp_path;
 int g_mtp_max_t = 0;
-bool mtp_load(const std::string& rt_dir, int max_t, std::string& err) {
+strata::core::QsaState* g_mtp_kv = nullptr;
+bool mtp_load(const std::string& rt_dir, int max_t, strata::core::QsaState* kv, std::string& err) {
     (void) err;
     // the MTP model in GGUF form (tools/mtp_pack.py) beside the rt directory: STRATA_METAL_MTP_GGUF, else
     // <rt>/../mtp-q2_0.gguf
@@ -2558,10 +2596,13 @@ bool mtp_load(const std::string& rt_dir, int max_t, std::string& err) {
     }
     g_mtp_path = path;
     g_mtp_max_t = max_t;
+    g_mtp_kv = kv;
+    if (g_window != nullptr && g_window->ready() && !g_window->mtp_loaded())
+        return g_window->mtp_load(g_mtp_path, g_mtp_max_t, g_mtp_kv, err);
     return true;
 }
 bool mtp_load_pending(Window* w, std::string& err) {
-    return g_mtp_path.empty() || w->mtp_load(g_mtp_path, g_mtp_max_t, err);
+    return g_mtp_path.empty() || w->mtp_loaded() || w->mtp_load(g_mtp_path, g_mtp_max_t, g_mtp_kv, err);
 }
 // Prefill::run's Metal side: the prompt read through the window, MAXT rows at a time (no head), each window
 // committed; on_chunk (the MTP's K/V) after each, with the window's final residual rows in place.
