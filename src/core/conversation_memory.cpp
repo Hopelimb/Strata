@@ -290,18 +290,19 @@ std::optional<HostMemoryReading> sample_host_memory() {
 #elif defined(__linux__)
     return sample_host_memory(MemoryProbePaths{}, memory_limit_bytes());
 #elif defined(__APPLE__)
+    // The rule of metal/src/engine/arena_budget.h's arena_avail(): free + purgeable pages, plus the inactive and speculative
+    // ones only up to the file-backed page count (other programs' inactive anonymous memory is what compresses or swaps).
     vm_statistics64_data_t vs{};
     mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
-    vm_size_t page_bytes = 0;
-    if (host_page_size(mach_host_self(), &page_bytes) != KERN_SUCCESS ||
-        host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vs, &count) != KERN_SUCCESS)
-        return {};
-    const uint64_t avail = ((uint64_t) vs.free_count + vs.inactive_count + vs.purgeable_count) * (uint64_t) page_bytes;
-    uint64_t phys = 0;
-    size_t len = sizeof phys;
-    std::optional<uint64_t> total;
-    if (sysctlbyname("hw.memsize", &phys, &len, nullptr, 0) == 0 && phys > 0) total = phys;
-    return combine(avail, total, CgroupScan{}, memory_limit_bytes());
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vs, &count) != KERN_SUCCESS) return {};
+    uint64_t total = 0;
+    size_t len = sizeof total;
+    if (sysctlbyname("hw.memsize", &total, &len, nullptr, 0) != 0 || total == 0) return {};
+    const uint64_t pg = (uint64_t) vm_page_size;
+    const uint64_t available = ((uint64_t) vs.free_count + vs.purgeable_count) * pg +
+                               std::min<uint64_t>(((uint64_t) vs.inactive_count + vs.speculative_count) * pg,
+                                                  (uint64_t) vs.external_page_count * pg);
+    return combine(available, total, CgroupScan{}, memory_limit_bytes());
 #else
     return {};
 #endif
